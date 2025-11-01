@@ -1,0 +1,873 @@
+// MultiSaccadeCatchGame.jsx
+// ver. 1.0 (CATCH logic with 4 fázemi obtížnosti a plus-one pressure)
+//
+// Tento komponent respektuje standard iSenses:
+// - props { sessionId, taskId, emitEvent, emitScore }
+// - žádný fetch, žádné websockets
+// - všechna data jdou ven přes emitEvent() a emitScore()
+// - cleanup při unmountu
+// - metriky ve formátu iSenses při emitScore()
+// - izolovaný styling (inline styles)
+//
+// Herní logika shrnutí:
+// Fáze 1: vždy svítí jen jeden bod → hráč má kliknout dřív, než vyprší DURATION_MS
+// Fáze 2: wave rozsvítí všechny body → hráč musí "vyčistit" vše v časovém okně
+// Fáze 3: wave rozsvítí část bodů (concurrencyPct ~ 40→80 %) + může přidávat nové cíle v průběhu
+// Fáze 4: startuje s vysokým zatížením (~80 %) a navíc injektuje "plus-one" cíle s kratším limitem
+//
+// Adaptivní rychlost (CATCH pravidla, uložené v paměti):
+// - start DURATION_MS = 600 ms
+// - po každých 5 HIT spočítej průměrnou Reaction_Time_Avg posledních 5 HIT
+//   - pokud avg < 0.5 * DURATION_MS => zkrať DURATION_MS o 10 % (min 250 ms)
+//   - pokud avg > 0.8 * DURATION_MS && (Errors + MISS v posledních 5 pokusech >= 2)
+//       => prodluž DURATION_MS o 10 % (max 1200 ms)
+// - úprava rychlosti se aplikuje jen po HIT (ne po ERROR nebo MISS)
+//
+// Přechody fáze:
+// → 2 pokud Accuracy >=0.8 a SpeedScore <0.6×DURATION_MS (rolling ~30 pokusů)
+// → 3 pokud WaveAccuracy>=0.75 a WaveTime <=0.7×WaveTimeout (rolling posledních 5 waves)
+// → 4 pokud hráč udrží 3 waves po sobě:
+//      concurrencyPct ~80 %, Accuracy>=0.75, MISS<=1
+//
+// emitScore metriky (sjednocené názvy):
+// Completion_Time (ms): celková délka session
+// Reaction_Time_Avg (ms): průměr reakčních časů
+// Reaction_Time_List (array ms): seznam všech reakčních časů
+// Hits: počet úspěšných zásahů
+// Errors: počet chyb (MISS nebo pozdní zásah)
+// Total_Lines: ekvivalent počtu wave odehraných
+// Final_Speed: aktuální DURATION_MS na konci hry
+//
+// Poznámka: Tahle verze je single-session demo.
+// Po určitém počtu waves (např. 20) hra pošle emitScore() a skončí.
+
+import React, { useCallback, useEffect, useRef, useState } from "react";
+
+const GRID_ROWS = 4;
+const GRID_COLS = 4;
+const TOTAL_POSITIONS = GRID_ROWS * GRID_COLS;
+
+const WAVES_PER_SESSION = 20;
+const WAVE_TIMEOUT_MS = 2000; // maximální délka jedné wave fáze 2+
+const PLUS_ONE_INTERVAL_MS = 300; // fáze 4 injekt priority target
+const PLUS_ONE_DURATION_FACTOR = 0.7; // plus-one má kratší život
+
+// Helper: vytvoří pole indexů 0..TOTAL_POSITIONS-1
+function allPositions() {
+  return Array.from({ length: TOTAL_POSITIONS }, (_, i) => i);
+}
+
+// Náhodný výběr N unikátních prvků z array
+function sampleUnique(arr, count) {
+  if (count >= arr.length) return [...arr];
+  const copy = [...arr];
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    const idx = Math.floor(Math.random() * copy.length);
+    out.push(copy[idx]);
+    copy.splice(idx, 1);
+  }
+  return out;
+}
+
+// Metriky buffer pro adaptaci rychlosti
+function computeAvg(arr) {
+  if (!arr.length) return 0;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+export default function MultiSaccadeCatchGame({
+  sessionId,
+  taskId,
+  emitEvent,
+  emitScore,
+}) {
+  // === Herní stav ===
+
+  // herní fáze 1..4
+  const [phase, setPhase] = useState(1);
+
+  // kolik % pozic rozsvěcujeme u fáze 3/4 (0..1)
+  const [concurrencyPct, setConcurrencyPct] = useState(0.4); // začne 40 %
+
+  // adaptivní rychlost (ms jak dlouho bod "žije")
+  const [durationMs, setDurationMs] = useState(600); // DURATION_MS
+
+  // wave counter
+  const [waveIndex, setWaveIndex] = useState(0);
+
+  // aktivní cíle v aktuálním kole
+  // pole objektů: {id, startTs, expireTs, priority, hit, missed}
+  const [activeTargets, setActiveTargets] = useState([]);
+
+  // sběr metrik
+  const reactionTimesRef = useRef([]); // ms od rozsvitu do HIT
+  const lastHitsRef = useRef([]); // reakční časy posledních ~5 hitů pro adapt speed
+  const [hits, setHits] = useState(0);
+  const [errors, setErrors] = useState(0); // MISS počítáme do errors
+
+  // wave-level metriky pro fáze 2/3/4
+  const waveStatsRef = useRef([]); // [{waveDuration, waveHit, waveMiss, startTs, endTs, pctAtStart}]
+
+  // pro měření času session
+  const sessionStartRef = useRef(Date.now());
+
+  // plus-one injection timer
+  const plusOneTimerRef = useRef(null);
+
+  // wave timeout timer
+  const waveTimerRef = useRef(null);
+
+  // rerender tick (jen pro expirace)
+  const [, forceTick] = useState(0);
+  const rafRef = useRef(null);
+
+  // === interní utility ===
+
+  // vytvoř jeden target objekt
+  const createTarget = useCallback(
+    ({ id, now, dur, priority = false }) => {
+      return {
+        id,
+        startTs: now,
+        expireTs: now + dur,
+        priority,
+        hit: false,
+        missed: false,
+      };
+    },
+    []
+  );
+
+  // označ target jako hit
+  const registerHitOnTarget = useCallback(
+    (targetId) => {
+      setActiveTargets((prev) => {
+        const now = Date.now();
+        const next = prev.map((t) => {
+          if (t.id === targetId && !t.hit && !t.missed) {
+            const rt = now - t.startTs;
+
+            // update hit counters
+            setHits((h) => h + 1);
+
+            // ulož reakční čas
+            reactionTimesRef.current.push(rt);
+            lastHitsRef.current.push(rt);
+            if (lastHitsRef.current.length > 5) {
+              lastHitsRef.current.shift();
+            }
+
+            // emitEvent pro tento hit
+            emitEvent({
+              type: "HIT",
+              ts: now,
+              data: {
+                sessionId,
+                taskId,
+                targetId,
+                reactionTimeMs: rt,
+                phase,
+              },
+            });
+
+            return { ...t, hit: true };
+          }
+          return t;
+        });
+        return next;
+      });
+    },
+    [emitEvent, phase, sessionId, taskId]
+  );
+
+  // expirační logika, MISS
+  const expireCheck = useCallback(() => {
+    const now = Date.now();
+    setActiveTargets((prev) => {
+      const next = prev.map((t) => {
+        if (!t.hit && !t.missed && now >= t.expireTs) {
+          // miss
+          setErrors((e) => e + 1);
+
+          emitEvent({
+            type: "MISS",
+            ts: now,
+            data: {
+              sessionId,
+              taskId,
+              targetId: t.id,
+              phase,
+            },
+          });
+
+          return { ...t, missed: true };
+        }
+        return t;
+      });
+      return next;
+    });
+  }, [emitEvent, phase, sessionId, taskId]);
+
+  // force re-render loop for expireCheck
+  const tickLoop = useCallback(() => {
+    expireCheck();
+    forceTick((t) => t + 1);
+    rafRef.current = requestAnimationFrame(tickLoop);
+  }, [expireCheck]);
+
+  // === adaptivní úprava durationMs podle posledních 5 hitů ===
+  const maybeAdaptSpeed = useCallback(() => {
+    const last5 = lastHitsRef.current;
+    if (last5.length < 5) return;
+
+    const avgLast5 = computeAvg(last5);
+    const currentDur = durationMs;
+
+    // spočti posledních 5 missů/chyb?
+    // hrubě: vezmeme z waveStatsRef poslední wave a podíváme se na miss
+    const recentWave = waveStatsRef.current[waveStatsRef.current.length - 1];
+    const recentMiss = recentWave ? recentWave.waveMiss : 0;
+
+    // zrychlit
+    if (avgLast5 < 0.5 * currentDur) {
+      const faster = Math.max(Math.floor(currentDur * 0.9), 250);
+      setDurationMs(faster);
+      return;
+    }
+
+    // zpomalit
+    if (avgLast5 > 0.8 * currentDur && recentMiss >= 2) {
+      const slower = Math.min(Math.floor(currentDur * 1.1), 1200);
+      setDurationMs(slower);
+      return;
+    }
+  }, [durationMs]);
+
+  // === výpočet metrik pro přechody fáze ===
+
+  // Accuracy = HIT / (HIT+MISS)
+  const getAccuracy = useCallback(() => {
+    const h = hits;
+    const m = errors;
+    const total = h + m;
+    if (total === 0) return 0;
+    return h / total;
+  }, [hits, errors]);
+
+  // SpeedScore = průměr posledních 10 hitů
+  const getSpeedScore = useCallback(() => {
+    const recent = reactionTimesRef.current.slice(-10);
+    return computeAvg(recent);
+  }, []);
+
+  // Wave stats averages for phase promotion
+  const getRecentWaveStats = useCallback(() => {
+    const last5 = waveStatsRef.current.slice(-5);
+    if (!last5.length) {
+      return {
+        avgWaveAcc: 0,
+        avgWaveTimeRatio: 1,
+      };
+    }
+    const accArr = last5.map((w) => {
+      const attempted = w.waveHit + w.waveMiss;
+      if (!attempted) return 0;
+      return w.waveHit / attempted;
+    });
+    const avgWaveAcc =
+      accArr.reduce((a, b) => a + b, 0) / accArr.length || 0;
+
+    const timeRatios = last5.map((w) => {
+      // poměr skutečného trvání wave vůči timeoutu
+      const waveDur = w.waveDuration;
+      return waveDur / WAVE_TIMEOUT_MS;
+    });
+    const avgWaveTimeRatio =
+      timeRatios.reduce((a, b) => a + b, 0) / timeRatios.length || 1;
+
+    return {
+      avgWaveAcc,
+      avgWaveTimeRatio,
+    };
+  }, []);
+
+  // check přechod fází
+  const maybePromotePhase = useCallback(() => {
+    // Fáze 1 -> 2
+    if (phase === 1) {
+      const acc = getAccuracy();
+      const speedScore = getSpeedScore();
+      if (
+        acc >= 0.8 &&
+        speedScore > 0 && // když nemáme data, speedScore je 0 -> nechceme posun
+        speedScore < 0.6 * durationMs
+      ) {
+        setPhase(2);
+        return;
+      }
+    }
+
+    // Fáze 2 -> 3
+    if (phase === 2) {
+      const { avgWaveAcc, avgWaveTimeRatio } = getRecentWaveStats();
+      if (avgWaveAcc >= 0.75 && avgWaveTimeRatio <= 0.7) {
+        setPhase(3);
+        setConcurrencyPct(0.4); // start fáze 3 na 40 %
+        return;
+      }
+    }
+
+    // Fáze 3 -> 4
+    if (phase === 3) {
+      // poslední 3 waves musí být concurrencyPct ~0.8 a dobrý výkon
+      const last3 = waveStatsRef.current.slice(-3);
+      if (last3.length === 3) {
+        const good = last3.every((w) => {
+          const attempted = w.waveHit + w.waveMiss;
+          const acc = attempted ? w.waveHit / attempted : 0;
+          return (
+            w.pctAtStart >= 0.8 &&
+            acc >= 0.75 &&
+            w.waveMiss <= 1
+          );
+        });
+        if (good) {
+          setPhase(4);
+          setConcurrencyPct(0.8);
+          return;
+        }
+      }
+    }
+
+    // Fáze 4 už dál nejde
+  }, [
+    phase,
+    durationMs,
+    getAccuracy,
+    getRecentWaveStats,
+    getSpeedScore,
+  ]);
+
+  // === spawn wave podle fáze ===
+
+  const spawnWavePhase1 = useCallback(() => {
+    // vždy jen 1 target
+    const now = Date.now();
+    const id = "t_" + now + "_" + Math.floor(Math.random() * 9999);
+    const t = createTarget({
+      id,
+      now,
+      dur: durationMs,
+      priority: false,
+    });
+
+    setActiveTargets([t]);
+
+    emitEvent({
+      type: "START_WAVE",
+      ts: now,
+      data: {
+        sessionId,
+        taskId,
+        phase: 1,
+        targets: [t.id],
+      },
+    });
+
+    // wave v p1 je vlastně sekvence “po jednom”, tzn. neřešíme WAVE_TIMEOUT_MS
+    // po expiraci prostě hned další spawn, děje se v onWaveEndPhase1
+  }, [createTarget, durationMs, emitEvent, sessionId, taskId]);
+
+  const onWaveEndPhase1 = useCallback(() => {
+    // Konec jednoho pokusu (target hit/miss), hned nový
+    maybeAdaptSpeed();
+    maybePromotePhase();
+    spawnWavePhase1();
+  }, [maybeAdaptSpeed, maybePromotePhase, spawnWavePhase1]);
+
+  const spawnWaveCommon = useCallback(
+    (pctStart) => {
+      const now = Date.now();
+      const pos = allPositions();
+      const howMany = Math.max(
+        1,
+        Math.floor(TOTAL_POSITIONS * pctStart)
+      );
+      const chosen = sampleUnique(pos, howMany);
+
+      const targets = chosen.map((cellId) =>
+        createTarget({
+          id: "t_" + now + "_" + cellId,
+          now,
+          dur: durationMs,
+          priority: false,
+        })
+      );
+
+      setActiveTargets(targets);
+
+      emitEvent({
+        type: "START_WAVE",
+        ts: now,
+        data: {
+          sessionId,
+          taskId,
+          phase,
+          targets: targets.map((t) => t.id),
+          pctAtStart: pctStart,
+        },
+      });
+
+      // Spustíme wave timeout
+      if (waveTimerRef.current) {
+        clearTimeout(waveTimerRef.current);
+      }
+      waveTimerRef.current = setTimeout(() => {
+        endWave(pctStart);
+      }, WAVE_TIMEOUT_MS);
+
+      // Fáze 4: plus-one injection
+      if (phase === 4) {
+        if (plusOneTimerRef.current) {
+          clearInterval(plusOneTimerRef.current);
+        }
+        plusOneTimerRef.current = setInterval(() => {
+          injectPlusOneTarget();
+        }, PLUS_ONE_INTERVAL_MS);
+      }
+    },
+    [
+      createTarget,
+      durationMs,
+      emitEvent,
+      injectPlusOneTarget,
+      phase,
+      sessionId,
+      taskId,
+    ]
+  );
+
+  // inject plus-one (pouze fáze 4)
+  const injectPlusOneTarget = useCallback(() => {
+    if (phase !== 4) return;
+    const now = Date.now();
+
+    // najdi volnou pozici, která není aktivní
+    const activeIds = new Set(activeTargets.map((t) => t.id));
+    const allPos = allPositions();
+    // použij index pozice jako suffix
+    let freePos = null;
+    for (let p of allPos) {
+      const candidateIdPrefix = "_cell_" + p + "_";
+      // hrubá kontrola: pokud nějaký aktivní target má stejné "_cell_p_" v ID, ber to jako obsazeno
+      const occupied = [...activeIds].some((id) =>
+        id.includes(candidateIdPrefix)
+      );
+      if (!occupied) {
+        freePos = p;
+        break;
+      }
+    }
+    if (freePos === null) return; // všechno obsazené
+
+    const dur = Math.floor(durationMs * PLUS_ONE_DURATION_FACTOR);
+    const newTarget = createTarget({
+      id: "tP_" + now + "_cell_" + freePos,
+      now,
+      dur,
+      priority: true,
+    });
+
+    setActiveTargets((prev) => [...prev, newTarget]);
+
+    emitEvent({
+      type: "PLUS_ONE",
+      ts: now,
+      data: {
+        sessionId,
+        taskId,
+        phase,
+        targetId: newTarget.id,
+        durationMs: dur,
+      },
+    });
+  }, [activeTargets, createTarget, durationMs, emitEvent, phase, sessionId, taskId]);
+
+  // vyhodnocení wave a přechod na další wave
+  const endWave = useCallback(
+    (pctAtStart) => {
+      // stop plusOne timer
+      if (plusOneTimerRef.current) {
+        clearInterval(plusOneTimerRef.current);
+        plusOneTimerRef.current = null;
+      }
+
+      // spočti výsledky wave
+      const now = Date.now();
+      setActiveTargets((prev) => {
+        // označ zbývající nehitnuté jako MISS
+        const finalized = prev.map((t) => {
+          if (!t.hit && !t.missed) {
+            // MISS
+            setErrors((e) => e + 1);
+            emitEvent({
+              type: "MISS",
+              ts: now,
+              data: {
+                sessionId,
+                taskId,
+                targetId: t.id,
+                phase,
+              },
+            });
+            return { ...t, missed: true };
+          }
+          return t;
+        });
+
+        // wave stats
+        const waveHit = finalized.filter((t) => t.hit).length;
+        const waveMiss = finalized.filter((t) => t.missed && !t.hit).length;
+
+        const firstTs = finalized.length
+          ? Math.min(...finalized.map((t) => t.startTs))
+          : now;
+        const waveDuration = now - firstTs;
+
+        waveStatsRef.current.push({
+          waveDuration,
+          waveHit,
+          waveMiss,
+          startTs: firstTs,
+          endTs: now,
+          pctAtStart,
+        });
+
+        emitEvent({
+          type: "END_WAVE",
+          ts: now,
+          data: {
+            sessionId,
+            taskId,
+            phase,
+            waveHit,
+            waveMiss,
+            waveDuration,
+            pctAtStart,
+          },
+        });
+
+        // wave complete → adapt speed, promote phase
+        maybeAdaptSpeed();
+        maybePromotePhase();
+
+        // další wave nebo konec session
+        setWaveIndex((idx) => {
+          const nextIdx = idx + 1;
+          if (nextIdx >= WAVES_PER_SESSION) {
+            endSession();
+          } else {
+            // spawn další wave dle nové fáze
+            // fáze 2: 100 %, fáze 3: concurrencyPct (a adapt concurrencyPct), fáze 4: concurrencyPct
+            setTimeout(() => {
+              if (phase === 2) {
+                spawnWaveCommon(1.0);
+              } else if (phase === 3) {
+                // adapt concurrencyPct podle výkonu
+                const lastWave = waveStatsRef.current[waveStatsRef.current.length - 1];
+                if (lastWave) {
+                  const attempted = lastWave.waveHit + lastWave.waveMiss;
+                  const acc =
+                    attempted > 0 ? lastWave.waveHit / attempted : 0;
+
+                  // pokud hráč drží výkon -> zvedáme zatížení až k 0.8
+                  if (
+                    acc >= 0.7 &&
+                    computeAvg(lastHitsRef.current.slice(-5)) <
+                      0.6 * durationMs
+                  ) {
+                    setConcurrencyPct((p) =>
+                      Math.min(0.8, parseFloat((p + 0.1).toFixed(2)))
+                    );
+                  }
+
+                  // pokud padá výkon -> sniž
+                  if (
+                    acc < 0.5 ||
+                    computeAvg(lastHitsRef.current.slice(-5)) >
+                      0.8 * durationMs
+                  ) {
+                    setConcurrencyPct((p) =>
+                      Math.max(0.3, parseFloat((p - 0.1).toFixed(2)))
+                    );
+                  }
+                }
+                spawnWaveCommon(concurrencyPct);
+              } else if (phase === 4) {
+                spawnWaveCommon(concurrencyPct); // plus-one se řeší uvnitř
+              } else {
+                // fallback: phase1 nepoužívá wave timeout, ale ok
+                spawnWavePhase1();
+              }
+            }, 100);
+          }
+          return nextIdx;
+        });
+
+        return finalized;
+      });
+    },
+    [
+      concurrencyPct,
+      durationMs,
+      emitEvent,
+      endSession,
+      maybeAdaptSpeed,
+      maybePromotePhase,
+      phase,
+      sessionId,
+      spawnWaveCommon,
+      spawnWavePhase1,
+      taskId,
+    ]
+  );
+
+  // Konec celé session → emitScore
+  const endSession = useCallback(() => {
+    // session metriky
+    const now = Date.now();
+    const completionTime = now - sessionStartRef.current;
+    const reactionList = reactionTimesRef.current;
+    const reactionAvg = computeAvg(reactionList);
+
+    // Final_Speed = aktuální durationMs
+    // Total_Lines = počet odehraných waves
+    // Errors = celkový MISS
+    emitScore({
+      taskId,
+      metrics: {
+        Completion_Time: completionTime,
+        Reaction_Time_Avg: reactionAvg || 0,
+        Reaction_Time_List: reactionList,
+        Hits: hits,
+        Errors: errors,
+        Total_Lines: waveIndex + 1,
+        Final_Speed: durationMs,
+      },
+    });
+
+    emitEvent({
+      type: "END_SESSION",
+      ts: now,
+      data: {
+        sessionId,
+        taskId,
+        phase,
+        completionTimeMs: completionTime,
+        hits,
+        errors,
+        wavesPlayed: waveIndex + 1,
+        finalDurationMs: durationMs,
+      },
+    });
+
+    // stop loop timers
+    if (waveTimerRef.current) clearTimeout(waveTimerRef.current);
+    if (plusOneTimerRef.current) clearInterval(plusOneTimerRef.current);
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+  }, [durationMs, emitEvent, emitScore, errors, hits, phase, taskId, waveIndex]);
+
+  // === klik na target ===
+  const handleCellClick = useCallback(
+    (targetId) => {
+      // registruj HIT
+      registerHitOnTarget(targetId);
+
+      // pokud jsme ve fázi 1:
+      // fáze 1 jede "po jednom" cíli → pokud ho hráč trefí, wave okamžitě končí a spawn další
+      if (phase === 1) {
+        // zkontrolujeme, jestli ten target byl opravdu aktivní
+        const stillActive = activeTargets.find(
+          (t) => t.id === targetId && !t.hit && !t.missed
+        );
+        if (stillActive) {
+          // ukonči minivlnu a rozjeď další
+          onWaveEndPhase1();
+        }
+      } else {
+        // ve fázích 2-4 se wave hodnotí hromadně po WAVE_TIMEOUT_MS
+        // volitelné rozšíření: můžeme wave ukončit okamžitě, když jsou všechny vypnuté
+        setActiveTargets((prev) => {
+          const after = prev.map((t) =>
+            t.id === targetId && !t.hit && !t.missed
+              ? { ...t, hit: true }
+              : t
+          );
+          const allDone = after.every((t) => t.hit || t.missed);
+          if (allDone) {
+            // wave je vyčištěna dřív než timeout => ukonči wave teď
+            if (waveTimerRef.current) {
+              clearTimeout(waveTimerRef.current);
+              waveTimerRef.current = null;
+            }
+            endWave(concurrencyPct);
+          }
+          return after;
+        });
+      }
+    },
+    [
+      activeTargets,
+      concurrencyPct,
+      endWave,
+      onWaveEndPhase1,
+      phase,
+      registerHitOnTarget,
+    ]
+  );
+
+  // === start hry ===
+  useEffect(() => {
+    // emit START
+    const now = Date.now();
+    emitEvent({
+      type: "START",
+      ts: now,
+      data: {
+        sessionId,
+        taskId,
+      },
+    });
+
+    // start expirační smyčky
+    rafRef.current = requestAnimationFrame(tickLoop);
+
+    // první wave podle fáze 1
+    spawnWavePhase1();
+
+    return () => {
+      // cleanup při unmountu
+      if (waveTimerRef.current) clearTimeout(waveTimerRef.current);
+      if (plusOneTimerRef.current) clearInterval(plusOneTimerRef.current);
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // pouze při mountu
+
+  // === Vizualizace ===
+  // Budeme renderovat GRID_ROWS x GRID_COLS čtverců.
+  // Aktivní target = zelený (priority target = výraznější odstín / tlustý rámeček).
+  // Neaktivní = tmavý.
+
+  function renderCell(row, col) {
+    const cellIdx = row * GRID_COLS + col;
+    // najdi target v téhle buňce
+    // Abychom našli match, použijeme heuristiku:
+    // - ID vypadá jako "t_<timestamp>_<cellId>" nebo "tP_<timestamp>_cell_<cellId>"
+    let cellTarget = null;
+    for (const t of activeTargets) {
+      // pokus odhadnout cellId uvnitř t.id
+      if (t.id.endsWith("_" + cellIdx) || t.id.includes("_cell_" + cellIdx)) {
+        if (!t.hit && !t.missed) {
+          cellTarget = t;
+          break;
+        }
+      }
+    }
+
+    const isActive = !!cellTarget;
+    const isPriority = cellTarget?.priority;
+
+    const styleCell = {
+      width: "80px",
+      height: "80px",
+      margin: "4px",
+      borderRadius: "8px",
+      border: isPriority ? "4px solid #0f0" : "2px solid #0f0",
+      backgroundColor: isActive ? "#00ff00" : "#1a1a1a",
+      opacity: isActive ? 1.0 : 0.2,
+      boxSizing: "border-box",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      fontFamily: "sans-serif",
+      fontSize: "16px",
+      fontWeight: "600",
+      color: "#000",
+      cursor: isActive ? "pointer" : "default",
+      userSelect: "none",
+    };
+
+    return (
+      <div
+        key={cellIdx}
+        style={styleCell}
+        onClick={() => {
+          if (cellTarget) {
+            handleCellClick(cellTarget.id);
+          }
+        }}
+      >
+        {isActive ? (isPriority ? "!" : "") : ""}
+      </div>
+    );
+  }
+
+  const styleWrapper = {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "flex-start",
+    padding: "16px",
+    backgroundColor: "#000",
+    color: "#0f0",
+    minHeight: "100vh",
+    boxSizing: "border-box",
+    fontFamily: "sans-serif",
+  };
+
+  const styleGrid = {
+    display: "grid",
+    gridTemplateColumns: `repeat(${GRID_COLS}, 88px)`,
+    gridTemplateRows: `repeat(${GRID_ROWS}, 88px)`,
+    gap: "0px",
+    marginBottom: "16px",
+  };
+
+  const styleInfoRow = {
+    display: "flex",
+    flexDirection: "row",
+    gap: "24px",
+    fontSize: "14px",
+    fontFamily: "monospace",
+  };
+
+  const accuracyPct = (getAccuracy() * 100).toFixed(0);
+  const avgRt = computeAvg(reactionTimesRef.current).toFixed(0);
+
+  return (
+    <div style={styleWrapper}>
+      <div style={styleGrid}>
+        {Array.from({ length: GRID_ROWS }).map((_, r) =>
+          Array.from({ length: GRID_COLS }).map((_, c) =>
+            renderCell(r, c)
+          )
+        )}
+      </div>
+
+      <div style={styleInfoRow}>
+        <div>Phase: {phase}</div>
+        <div>Wave: {waveIndex + 1}/{WAVES_PER_SESSION}</div>
+        <div>Hits: {hits}</div>
+        <div>Errors: {errors}</div>
+        <div>Acc: {accuracyPct}%</div>
+        <div>AvgRT: {avgRt} ms</div>
+        <div>DUR: {durationMs} ms</div>
+        {phase >= 3 ? (
+          <div>Load: {(concurrencyPct * 100).toFixed(0)}%</div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
