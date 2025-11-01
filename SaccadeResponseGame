@@ -1,0 +1,744 @@
+import React, { useCallback, useEffect, useRef, useState } from "react";
+
+/**
+ * SSaccadeResponseGame v1
+ *
+ * Diagnostická verze podle specifikace:
+ * - Pohybuje se pouze zleva doprava.
+ * - 21 řádků pod sebou (lineSpacing = 100 px).
+ * - Každý řádek = samostatný průjezd zleva doprava.
+ * - Tečka (40 px) jede konstantní rychlostí ~1536 px/s (3840 px za 2.5 s).
+ * - Na každém řádku je 5–7 zastavení:
+ *    - pevně začátek řádku (x=0)
+ *    - pevně konec řádku (x=šířka-40)
+ *    - mezi tím náhodné 3–4 zastávky
+ * - Ve chvíli zastavení se tečka rozsvítí zeleně ("Go"), čeká na klik.
+ * - Reakce:
+ *    - klik v zelené fázi → HIT (logujeme reactionTimeMs)
+ *    - nekliknutí do timeoutu → MISS
+ *    - klik mimo zelenou fázi → ERROR
+ * - Po dokončení poslední zastávky na řádku pauza 600 ms, posun o 100 px níž, návrat na start, další řádek.
+ * - Po 21. řádku konec, emitScore.
+ *
+ * Exportované metriky odpovídají iSenses emitEvent / emitScore:
+ * - emitEvent({ type, ts, data })
+ * - emitScore({ taskId, metrics })
+ *
+ * Komponenta je připravená pro fixed panel 3840x2160 (iiyama ProLite LFD, 42.5", 4K).
+ */
+
+type SaccadeResponseGameProps = {
+  sessionId: string;
+  taskId: string;
+  emitEvent?: (payload: {
+    type: string;
+    ts: number;
+    data: Record<string, any>;
+  }) => void;
+  emitScore?: (payload: {
+    taskId: string;
+    metrics: Record<string, any>;
+  }) => void;
+};
+
+// Konstanty prostředí
+const PANEL_WIDTH = 3840;
+const PANEL_HEIGHT = 2160;
+const DOT_SIZE = 40; // px průměr
+const LINE_COUNT = 21;
+const LINE_SPACING = 100; // px vertikální rozestup
+const ROW_DURATION_MS = 2500; // 2.5 s průjezd
+const MOVE_SPEED_PX_PER_S = PANEL_WIDTH / (ROW_DURATION_MS / 1000); // ~1536 px/s
+const GO_WINDOW_MS = 350; // jak dlouho svítí "Go" zeleně
+const REACTION_TIMEOUT_MS = 800; // max čas pro reakci (HIT), jinak MISS
+const BETWEEN_LINES_PAUSE_MS = 600; // pauza mezi řádky
+
+// Pomocné typy
+type StopPoint = {
+  x: number; // pozice v pixelech v aktuálním řádku
+  isEdge: boolean; // true = začátek nebo konec řádku (měříme sakkadu vpřed/zpět)
+};
+
+// Pomocné funkce
+function randInt(min: number, max: number) {
+  return Math.floor(min + Math.random() * (max - min + 1));
+}
+
+// Vygeneruje zastávky pro 1 řádek:
+// - první stop x=0 (isEdge=true)
+// - poslední stop x=maxRight (isEdge=true)
+// - mezi tím 3–4 náhodné vnitřní zastávky
+function generateStopsForLine(): StopPoint[] {
+  const innerCount = randInt(3, 4); // náhodně 3 nebo 4
+  const usableWidth = PANEL_WIDTH - DOT_SIZE; // aby kolečko nepřetékalo vpravo
+
+  const stops: StopPoint[] = [];
+  // začátek
+  stops.push({ x: 0, isEdge: true });
+
+  for (let i = 0; i < innerCount; i++) {
+    // rovnoměrně rozdělit průjezd a přidat jitter ±5 %
+    const frac = (i + 1) / (innerCount + 1); // hodnoty mezi (0,1)
+    const jitter = frac + (Math.random() * 0.1 - 0.05);
+    let xPos = Math.round(jitter * usableWidth);
+    if (xPos < 0) xPos = 0;
+    if (xPos > usableWidth) xPos = usableWidth;
+    stops.push({ x: xPos, isEdge: false });
+  }
+
+  // konec
+  stops.push({ x: usableWidth, isEdge: true });
+
+  // seřadit podle X
+  stops.sort((a, b) => a.x - b.x);
+  return stops;
+}
+
+// Vygeneruje všech 21 řádků dopředu
+function generateAllLines() {
+  const lines: StopPoint[][] = [];
+  for (let i = 0; i < LINE_COUNT; i++) {
+    lines.push(generateStopsForLine());
+  }
+  return lines;
+}
+
+// Spočítá Eukleidovskou vzdálenost kliknutí od středu tečky
+function getDistanceError(
+  clickX: number,
+  clickY: number,
+  dotX: number,
+  dotY: number
+) {
+  const cx = dotX + DOT_SIZE / 2;
+  const cy = dotY + DOT_SIZE / 2;
+  const dx = clickX - cx;
+  const dy = clickY - cy;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+// Test, jestli je klik uvnitř kruhu tečky
+function isInsideDot(
+  clickX: number,
+  clickY: number,
+  dotX: number,
+  dotY: number
+) {
+  return getDistanceError(clickX, clickY, dotX, dotY) <= DOT_SIZE / 2;
+}
+
+const SaccadeResponseGame: React.FC<SaccadeResponseGameProps> = ({
+  sessionId,
+  taskId,
+  emitEvent,
+  emitScore,
+}) => {
+  // ==== Stav hry ====
+
+  // běží / dokončeno
+  const [running, setRunning] = useState(false);
+  const [finished, setFinished] = useState(false);
+
+  // linie (0..20)
+  const [lineIndex, setLineIndex] = useState(0);
+
+  // index zastávky v aktuální linii (0..N-1)
+  const [stopIndex, setStopIndex] = useState(0);
+
+  // aktuální pozice tečky
+  const [dotX, setDotX] = useState(0);
+  const [dotY, setDotY] = useState(0);
+
+  // barva tečky: "white" | "green" | "red"
+  const [dotColor, setDotColor] = useState<"white" | "green" | "red">("white");
+
+  // jsme v Go fázi?
+  const [inGoPhase, setInGoPhase] = useState(false);
+
+  // čekáme na reakci hráče pro tuto zastávku?
+  const [awaitingReaction, setAwaitingReaction] = useState(false);
+
+  // pauza mezi řádky?
+  const [linePause, setLinePause] = useState(false);
+
+  // předepsané zastávky pro všechny řádky
+  const [allLinesStops, setAllLinesStops] = useState<StopPoint[][]>([]);
+
+  // sběr metrik v průběhu
+  const hitsRef = useRef(0);
+  const errorsRef = useRef(0);
+  const missRef = useRef(0);
+  const reactionTimesRef = useRef<number[]>([]);
+  const startTimestampRef = useRef<number | null>(null);
+
+  // čas rozsvícení zelené pro aktuální zastávku
+  const goStartTsRef = useRef<number | null>(null);
+
+  // frame loop
+  const requestRef = useRef<number | null>(null);
+  const lastFrameRef = useRef<number | null>(null);
+
+  // interní guard proti dvojitému ukončení
+  const endedRef = useRef(false);
+
+  // ==== pomocné logování do emitEvent ====
+  const logEvent = useCallback(
+    (type: string, data: Record<string, any>) => {
+      emitEvent?.({
+        type,
+        ts: Date.now(),
+        data: {
+          sessionId,
+          taskId,
+          lineIndex: lineIndex + 1, // 1..21
+          stopIndex,
+          positionX: dotX,
+          positionY: dotY,
+          speedPxPerS: MOVE_SPEED_PX_PER_S,
+          ...data,
+        },
+      });
+    },
+    [emitEvent, sessionId, taskId, lineIndex, stopIndex, dotX, dotY]
+  );
+
+  // ==== spuštění/reset hry ====
+  const startGame = useCallback(() => {
+    const lines = generateAllLines();
+    setAllLinesStops(lines);
+
+    hitsRef.current = 0;
+    errorsRef.current = 0;
+    missRef.current = 0;
+    reactionTimesRef.current = [];
+
+    setRunning(true);
+    setFinished(false);
+    endedRef.current = false;
+
+    setLineIndex(0);
+    setStopIndex(0);
+
+    // první řádek, první stop
+    const firstStop = lines[0][0];
+    setDotX(firstStop.x);
+    setDotY(0 * LINE_SPACING);
+
+    // start = rovnou Go fáze na první zastávce
+    setDotColor("green");
+    setInGoPhase(true);
+    setAwaitingReaction(true);
+    goStartTsRef.current = Date.now();
+
+    startTimestampRef.current = Date.now();
+    logEvent("START", {});
+
+    // načasuj frame loop
+    lastFrameRef.current = performance.now();
+    requestRef.current = requestAnimationFrame(gameLoop);
+  }, [logEvent]);
+
+  // ==== ukončení hry ====
+  const endGame = useCallback(() => {
+    if (endedRef.current) return;
+    endedRef.current = true;
+
+    setRunning(false);
+    setFinished(true);
+
+    // spočítat metriky
+    const now = Date.now();
+    const completionTime =
+      startTimestampRef.current != null
+        ? now - startTimestampRef.current
+        : null;
+
+    const rtList = reactionTimesRef.current.slice();
+    const avgReaction =
+      rtList.length > 0
+        ? Math.round(rtList.reduce((a, b) => a + b, 0) / rtList.length)
+        : null;
+    const bestReaction =
+      rtList.length > 0 ? Math.min(...rtList) : null;
+
+    const totalLinesDone = lineIndex + 1; // kolik řádků reálně proběhlo
+
+    emitScore?.({
+      taskId,
+      metrics: {
+        Completion_Time: completionTime,
+        Reaction_Time_List: rtList,
+        Reaction_Time_Avg: avgReaction,
+        Reaction_Time_Best: bestReaction,
+        Hits: hitsRef.current,
+        Errors: errorsRef.current,
+        Miss: missRef.current,
+        Total_Lines: totalLinesDone,
+        Final_Speed: MOVE_SPEED_PX_PER_S,
+      },
+    });
+
+    logEvent("END", {
+      Hits: hitsRef.current,
+      Errors: errorsRef.current,
+      Miss: missRef.current,
+      Reaction_Time_Avg: avgReaction,
+      Reaction_Time_Best: bestReaction,
+      Total_Lines: totalLinesDone,
+    });
+
+    if (requestRef.current !== null) {
+      cancelAnimationFrame(requestRef.current);
+      requestRef.current = null;
+    }
+  }, [emitScore, taskId, lineIndex, logEvent]);
+
+  // ==== vyvolání Go fáze na konkrétní zastávce ====
+  const enterGoPhaseAtStop = useCallback(
+    (lineIdx: number, stopIdx: number, xPos: number) => {
+      const yPos = lineIdx * LINE_SPACING;
+
+      setLineIndex(lineIdx);
+      setStopIndex(stopIdx);
+      setDotX(xPos);
+      setDotY(yPos);
+
+      setDotColor("green");
+      setInGoPhase(true);
+      setAwaitingReaction(true);
+
+      goStartTsRef.current = Date.now();
+
+      logEvent("GO_ON", {
+        positionX: xPos,
+        positionY: yPos,
+      });
+    },
+    [logEvent]
+  );
+
+  // ==== MISS kontrola (pokud hráč nereaguje) ====
+  const checkMissTimeout = useCallback(() => {
+    if (!inGoPhase || !awaitingReaction) return;
+    const started = goStartTsRef.current;
+    if (!started) return;
+    const elapsed = Date.now() - started;
+    if (elapsed > REACTION_TIMEOUT_MS) {
+      // MISS
+      missRef.current += 1;
+      setAwaitingReaction(false);
+      setInGoPhase(false);
+      setDotColor("white");
+
+      logEvent("MISS", {
+        reactionTimeMs: null,
+      });
+    }
+  }, [inGoPhase, awaitingReaction, logEvent]);
+
+  // ==== Pokračování na další zastávku v rámci stejného řádku ====
+  const goToNextStopOnLine = useCallback(
+    (lineIdx: number, currentStopIdx: number) => {
+      const stops = allLinesStops[lineIdx];
+      if (!stops) {
+        endGame();
+        return;
+      }
+
+      const nextStopIdx = currentStopIdx + 1;
+      if (nextStopIdx >= stops.length) {
+        // konec řádku → přechod na další řádek
+        logEvent("LINE_END", {
+          lineDone: lineIdx + 1,
+        });
+
+        // meziřádková pauza
+        setLinePause(true);
+
+        setTimeout(() => {
+          const newLineIdx = lineIdx + 1;
+          if (newLineIdx >= LINE_COUNT) {
+            endGame();
+            return;
+          }
+
+          const newStops = allLinesStops[newLineIdx];
+          const firstStop = newStops[0];
+
+          setLinePause(false);
+          enterGoPhaseAtStop(newLineIdx, 0, firstStop.x);
+        }, BETWEEN_LINES_PAUSE_MS);
+
+        return;
+      }
+
+      // další zastávka na stejném řádku → začneme se k ní pohybovat
+      // tady jen přepneme stav tak, aby movement loop jel k dalšímu bodu
+      setStopIndex(nextStopIdx);
+      setInGoPhase(false);
+      setAwaitingReaction(false);
+      setDotColor("white");
+      goStartTsRef.current = null;
+    },
+    [allLinesStops, endGame, enterGoPhaseAtStop, logEvent]
+  );
+
+  // ==== pohyb směrem k aktuální cílové zastávce ====
+  // logika: když nejsme v Go fázi a nečekáme reakci, posouváme dotX směrem k x aktuální zastávky
+  const gameLoop = useCallback(
+    (ts: number) => {
+      if (!running || finished) return;
+
+      // MISS timeout check (běží i během stání v Go fázi)
+      checkMissTimeout();
+
+      if (linePause) {
+        // pauza mezi řádky – nic nehýbej, jen počkej na timeout v goToNextStopOnLine
+        requestRef.current = requestAnimationFrame(gameLoop);
+        return;
+      }
+
+      const last = lastFrameRef.current ?? ts;
+      const dtMs = ts - last;
+      lastFrameRef.current = ts;
+
+      const currentStops = allLinesStops[lineIndex];
+      if (!currentStops) {
+        endGame();
+        return;
+      }
+
+      const targetStop = currentStops[stopIndex];
+
+      // Pokud jsme v Go fázi a čekáme na reakci, tečka stojí → neděláme posun.
+      if (!(inGoPhase && awaitingReaction)) {
+        // pohyb směrem k targetStop.x konstantní rychlostí
+        const dir = targetStop.x > dotX ? 1 : -1;
+        const distPx = (MOVE_SPEED_PX_PER_S * dtMs) / 1000;
+        let newX = dotX + dir * distPx;
+
+        // zda jsme dorazili / přešli přes cíl
+        const reached =
+          (dir > 0 && newX >= targetStop.x) ||
+          (dir < 0 && newX <= targetStop.x);
+
+        if (reached) {
+          // zarovnat pozici přesně
+          newX = targetStop.x;
+
+          // zastavíme pohyb → vstup do Go fáze
+          enterGoPhaseAtStop(lineIndex, stopIndex, newX);
+        }
+
+        setDotX(newX);
+        setDotY(lineIndex * LINE_SPACING);
+      }
+
+      requestRef.current = requestAnimationFrame(gameLoop);
+    },
+    [
+      running,
+      finished,
+      checkMissTimeout,
+      linePause,
+      allLinesStops,
+      lineIndex,
+      stopIndex,
+      inGoPhase,
+      awaitingReaction,
+      dotX,
+      enterGoPhaseAtStop,
+      endGame,
+    ]
+  );
+
+  // ==== reakce hráče (klik) ====
+  // klik během Go fáze = HIT
+  // klik mimo Go fázi = ERROR
+  const handlePointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      if (!running || finished) return;
+      if (linePause) return; // během pauzy nechceme nic
+
+      // klik souřadnice v ploše 3840x2160
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      const clickX = (e.clientX - rect.left) * (PANEL_WIDTH / rect.width);
+      const clickY = (e.clientY - rect.top) * (PANEL_HEIGHT / rect.height);
+
+      const inside = isInsideDot(clickX, clickY, dotX, dotY);
+      const distErr = getDistanceError(clickX, clickY, dotX, dotY);
+
+      if (inGoPhase && awaitingReaction) {
+        // HIT
+        const rt =
+          goStartTsRef.current != null
+            ? Date.now() - goStartTsRef.current
+            : null;
+
+        hitsRef.current += 1;
+        if (rt != null) {
+          reactionTimesRef.current.push(rt);
+        }
+
+        logEvent("HIT", {
+          reactionTimeMs: rt,
+          Touch_X: clickX,
+          Touch_Y: clickY,
+          Inside_Target: inside,
+          Distance_Error: distErr,
+        });
+
+        // ukončíme Go fázi, přejdeme k dalšímu stopu
+        setAwaitingReaction(false);
+        setInGoPhase(false);
+        setDotColor("white");
+        goStartTsRef.current = null;
+
+        // další stop / další řádek
+        goToNextStopOnLine(lineIndex, stopIndex);
+      } else {
+        // ERROR
+        errorsRef.current += 1;
+
+        logEvent("ERROR", {
+          Touch_X: clickX,
+          Touch_Y: clickY,
+          Inside_Target: inside,
+          Distance_Error: distErr,
+        });
+
+        // krátký vizuální trest červeně
+        setDotColor("red");
+        setTimeout(() => {
+          if (!running || finished) return;
+          // vrátit zpět správnou barvu podle stavu
+          if (inGoPhase && awaitingReaction) {
+            setDotColor("green");
+          } else {
+            setDotColor("white");
+          }
+        }, 150);
+      }
+    },
+    [
+      running,
+      finished,
+      linePause,
+      inGoPhase,
+      awaitingReaction,
+      dotX,
+      dotY,
+      goToNextStopOnLine,
+      lineIndex,
+      stopIndex,
+      logEvent,
+    ]
+  );
+
+  // ==== lifecycle animace ====
+  useEffect(() => {
+    if (running && requestRef.current === null) {
+      lastFrameRef.current = performance.now();
+      requestRef.current = requestAnimationFrame(gameLoop);
+    }
+    return () => {
+      if (requestRef.current !== null) {
+        cancelAnimationFrame(requestRef.current);
+        requestRef.current = null;
+      }
+    };
+  }, [running, gameLoop]);
+
+  // ==== UI ====
+
+  // barva kolečka
+  const dotColorCSS =
+    dotColor === "green"
+      ? "rgba(0,255,0,1)"
+      : dotColor === "red"
+      ? "rgba(255,0,0,1)"
+      : "rgba(255,255,255,1)";
+
+  // škálujeme herní oblast 3840x2160 do aktuálního viewportu s letterboxem,
+  // ale interní výpočty jedou v nativních px panelu
+  const containerStyle: React.CSSProperties = {
+    position: "relative",
+    width: "100vw",
+    height: "100vh",
+    backgroundColor: "#000",
+    overflow: "hidden",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    color: "#fff",
+    userSelect: "none",
+    touchAction: "none",
+  };
+
+  // vnitřní plocha v poměru 3840x2160, škálovaná přes CSS transform
+  // vypočet scale poměrně hrubý: 100vh versus panelHeight
+  const scaleY = typeof window !== "undefined" ? window.innerHeight / PANEL_HEIGHT : 1;
+  const scaleX = typeof window !== "undefined" ? window.innerWidth / PANEL_WIDTH : 1;
+  const scale = Math.min(scaleX, scaleY);
+
+  const stageStyle: React.CSSProperties = {
+    position: "relative",
+    width: PANEL_WIDTH,
+    height: PANEL_HEIGHT,
+    backgroundColor: "#0D2B55",
+    border: "2px solid #1a3a75",
+    overflow: "hidden",
+    transform: `scale(${scale})`,
+    transformOrigin: "center center",
+  };
+
+  // horizontální linky pro vizuální referenci řádků
+  const linesOverlay = Array.from({ length: LINE_COUNT }).map((_, idx) => {
+    const y = idx * LINE_SPACING;
+    return (
+      <div
+        key={idx}
+        style={{
+          position: "absolute",
+          left: 0,
+          top: y + DOT_SIZE / 2,
+          width: "100%",
+          borderTop: "1px solid rgba(255,255,255,0.08)",
+          fontSize: 10,
+          color: "rgba(255,255,255,0.4)",
+        }}
+      >
+        <span
+          style={{
+            position: "absolute",
+            left: 8,
+            top: -16,
+            background: "rgba(0,0,0,0.4)",
+            padding: "2px 4px",
+            borderRadius: 4,
+          }}
+        >
+          {idx + 1}
+        </span>
+      </div>
+    );
+  });
+
+  // samotná tečka
+  const dotStyle: React.CSSProperties = {
+    position: "absolute",
+    left: dotX,
+    top: dotY,
+    width: DOT_SIZE,
+    height: DOT_SIZE,
+    borderRadius: "50%",
+    backgroundColor: dotColorCSS,
+    border: "3px solid #fff",
+    boxShadow: "0 0 16px rgba(0,0,0,0.6)",
+  };
+
+  return (
+    <div style={containerStyle}>
+      <div
+        style={stageStyle}
+        onPointerDown={handlePointerDown}
+      >
+        {linesOverlay}
+
+        {/* Tečka (pokud hra neskončila) */}
+        {!finished && (
+          <div style={dotStyle} />
+        )}
+
+        {/* Overlay při konci */}
+        {finished && (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              backgroundColor: "rgba(0,0,0,0.6)",
+              color: "#fff",
+              fontSize: 48,
+              fontWeight: 600,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            Hotovo
+          </div>
+        )}
+      </div>
+
+      {/* Ovládací panel */}
+      <div
+        style={{
+          position: "absolute",
+          bottom: 24,
+          left: "50%",
+          transform: "translateX(-50%)",
+          backgroundColor: "rgba(0,0,0,0.6)",
+          border: "1px solid rgba(255,255,255,0.2)",
+          borderRadius: 12,
+          padding: "12px 16px",
+          fontSize: 14,
+          fontFamily: "monospace",
+          display: "flex",
+          gap: 16,
+          color: "#fff",
+          alignItems: "center",
+          minWidth: 400,
+          justifyContent: "center",
+        }}
+      >
+        {!running ? (
+          <button
+            style={{
+              padding: "8px 16px",
+              borderRadius: 8,
+              border: "none",
+              background: "#fff",
+              color: "#000",
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+            onClick={() => {
+              if (finished) {
+                // pokud jsme už dojeli, můžeme klidně re-startovat čistě
+                setFinished(false);
+              }
+              startGame();
+            }}
+          >
+            Start
+          </button>
+        ) : (
+          <button
+            style={{
+              padding: "8px 16px",
+              borderRadius: 8,
+              border: "none",
+              background: "#fff",
+              color: "#000",
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+            onClick={endGame}
+          >
+            Stop
+          </button>
+        )}
+
+        <div>Řádek: {lineIndex + 1} / {LINE_COUNT}</div>
+        <div>Zastávka: {stopIndex + 1}</div>
+        <div>HIT: {hitsRef.current}</div>
+        <div>ERR: {errorsRef.current}</div>
+        <div>MISS: {missRef.current}</div>
+        <div>GO: {inGoPhase ? "ANO" : "NE"}</div>
+      </div>
+    </div>
+  );
+};
+
+export default SaccadeResponseGame;
+
