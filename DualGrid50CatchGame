@@ -1,0 +1,542 @@
+import React, { useEffect, useRef, useState, useCallback } from "react";
+
+/**
+ * DualGrid50CatchGame
+ *
+ * Typ hry: CATCH (tempo řídí čas, ne hráč)
+ *
+ * Mechanika:
+ * - Dva gridy 50×50 (levý / pravý) vedle sebe přes celou obrazovku.
+ * - V každém gridu vždy svítí právě jedna buňka (tečka uprostřed buňky).
+ * - Tečka má barvu green/red podle pravidla 80 % zelená / 20 % červená,
+ *   nikdy dvě červené po sobě.
+ * - Target je viditelný jen po dobu DURATION_MS.
+ * - Pokud hráč včas klikne správně = HIT (měří se reakční čas).
+ * - Pokud neklikne = MISS.
+ * - Pokud klikne mimo target = ERROR.
+ * - Po HIT nebo MISS se okamžitě nastaví nový target a běží nové časové okno.
+ *
+ * Adaptivní rychlost (standard pro CATCH):
+ * - DURATION_MS je dynamické, začíná na 600 ms.
+ * - Po každých 5 HIT vyhodnotíme posledních 5 HIT:
+ *    - spočítáme průměr reakčních časů posledních 5 HIT (Reaction_Time_Avg_window5).
+ *    - pokud Reaction_Time_Avg_window5 < 0.5 * DURATION_MS:
+ *         zkrať DURATION_MS o 10 %, ale ne pod 250 ms.
+ *    - pokud Reaction_Time_Avg_window5 > 0.8 * DURATION_MS
+ *         a v posledních 5 pokusech (HIT / ERROR / MISS) je alespoň 2× ERROR nebo MISS:
+ *         prodluž DURATION_MS o 10 %, ale ne nad 1200 ms.
+ * - Úprava se děje jen po HIT (hráč není "trestán" chybou).
+ *
+ * iSenses standard rozhraní:
+ * props { sessionId, taskId, emitEvent, emitScore }
+ *
+ * emitEvent({
+ *   type: "START" | "HIT" | "ERROR" | "MISS" | "END",
+ *   ts: Date.now(),
+ *   data: {...}
+ * })
+ *
+ * emitScore({
+ *   taskId,
+ *   metrics: {
+ *     Completion_Time,
+ *     Reaction_Time_Avg,
+ *     Reaction_Time_List,
+ *     Hits,
+ *     Errors,
+ *     Total_Lines,
+ *     Final_Speed
+ *   }
+ * })
+ *
+ * DŮLEŽITÉ:
+ * - Žádné fetch, žádné websockety.
+ * - Všechna data ven jen přes emitEvent / emitScore.
+ * - Po unmountu pošleme END + emitScore a uklidíme timeout.
+ */
+
+const GRID_SIZE = 50; // 50 x 50
+const TOTAL_CELLS = GRID_SIZE * GRID_SIZE;
+
+// limity rychlosti pro adaptaci
+const DURATION_MS_START = 600;
+const DURATION_MS_MIN = 250;
+const DURATION_MS_MAX = 1200;
+
+export default function DualGrid50CatchGame({
+  sessionId,
+  taskId,
+  emitEvent,
+  emitScore,
+}) {
+  // aktivní cíle v levém a pravém gridu (index 0..2499)
+  const [leftTarget, setLeftTarget] = useState(null);
+  const [rightTarget, setRightTarget] = useState(null);
+
+  // barva aktuálního targetu ("green" | "red")
+  const [color, setColor] = useState("green");
+  const lastColorRef = useRef("green"); // kvůli pravidlu "žádné dvě red po sobě"
+
+  // dynamická rychlost pro CATCH (v ms)
+  const [durationMs, setDurationMs] = useState(DURATION_MS_START);
+  const durationRef = useRef(DURATION_MS_START); // ref pro timeout a porovnání
+
+  // čas a metriky
+  const startTimeRef = useRef(null);
+  const lastTargetShownTsRef = useRef(null); // timestamp rozsvícení aktuální dvojice
+
+  const hitsRef = useRef(0);
+  const errorsRef = useRef(0);
+
+  const reactionTimesRef = useRef([]); // všechny reakční časy HIT (ms)
+
+  // pro adaptaci a kvalitu:
+  // posledních 5 reakčních časů (jen HIT)
+  const lastHitRTsRef = useRef([]); // max length 5
+  // posledních 5 výsledků pokusů celkově: "HIT" | "ERROR" | "MISS"
+  const lastOutcomesRef = useRef([]); // max length 5
+
+  const gameRunningRef = useRef(false);
+  const expireTimeoutRef = useRef(null);
+
+  // --- pomocné funkce ---
+
+  const pickRandomCell = useCallback(() => {
+    return Math.floor(Math.random() * TOTAL_CELLS);
+  }, []);
+
+  // vybere barvu podle pravidla 80/20 a neumožní dvě červené po sobě
+  const pickColor = useCallback(() => {
+    let newColor = "green";
+
+    if (lastColorRef.current !== "red") {
+      const r = Math.random(); // 0..1
+      if (r < 0.2) {
+        // 20 % šance na červenou
+        newColor = "red";
+      }
+    }
+
+    lastColorRef.current = newColor;
+    return newColor;
+  }, []);
+
+  // udrž lastHitRTsRef max 5
+  const pushLastHitRT = useCallback((rtMs) => {
+    lastHitRTsRef.current.push(rtMs);
+    if (lastHitRTsRef.current.length > 5) {
+      lastHitRTsRef.current.shift();
+    }
+  }, []);
+
+  // udrž lastOutcomesRef max 5
+  const pushOutcome = useCallback((outcomeStr) => {
+    lastOutcomesRef.current.push(outcomeStr);
+    if (lastOutcomesRef.current.length > 5) {
+      lastOutcomesRef.current.shift();
+    }
+  }, []);
+
+  // adaptivní úprava durationMs. Volá se jen po HIT.
+  const maybeAdaptSpeed = useCallback(() => {
+    // adaptujeme jen pokud máme aspoň 5 HIT (hráč už něco předvedl)
+    if (lastHitRTsRef.current.length < 5) return;
+
+    // spočítej průměr reakčních časů z posledních 5 HIT
+    const sum = lastHitRTsRef.current.reduce((acc, v) => acc + v, 0);
+    const avgWindow5 = sum / lastHitRTsRef.current.length;
+
+    // spočítej chybovost z posledních 5 pokusů (ERROR nebo MISS)
+    let recentFails = 0;
+    for (let i = 0; i < lastOutcomesRef.current.length; i++) {
+      const o = lastOutcomesRef.current[i];
+      if (o === "ERROR" || o === "MISS") {
+        recentFails += 1;
+      }
+    }
+
+    const currentDuration = durationRef.current;
+
+    // zrychlit (hráč příliš rychlý):
+    // pokud průměr < 0.5 * DURATION_MS => zkrať o 10 %
+    if (avgWindow5 < 0.5 * currentDuration) {
+      let faster = Math.floor(currentDuration * 0.9); // -10 %
+      if (faster < DURATION_MS_MIN) faster = DURATION_MS_MIN;
+      durationRef.current = faster;
+      setDurationMs(faster);
+      return;
+    }
+
+    // zpomalit (hráč přetížený):
+    // pokud průměr > 0.8 * DURATION_MS a zároveň v posledních 5 pokusech >=2 ERROR/MISS
+    if (avgWindow5 > 0.8 * currentDuration && recentFails >= 2) {
+      let slower = Math.floor(currentDuration * 1.1); // +10 %
+      if (slower > DURATION_MS_MAX) slower = DURATION_MS_MAX;
+      durationRef.current = slower;
+      setDurationMs(slower);
+      return;
+    }
+
+    // jinak beze změny
+  }, []);
+
+  const clearExpireTimeout = useCallback(() => {
+    if (expireTimeoutRef.current) {
+      clearTimeout(expireTimeoutRef.current);
+      expireTimeoutRef.current = null;
+    }
+  }, []);
+
+  // naplánuje timeout, po kterém se target označí jako MISS a posune se dál
+  const scheduleExpire = useCallback(() => {
+    clearExpireTimeout();
+
+    const plannedDuration = durationRef.current;
+
+    expireTimeoutRef.current = setTimeout(() => {
+      if (!gameRunningRef.current) return;
+
+      // MISS = hráč nestihl kliknout v intervalu
+      pushOutcome("MISS");
+
+      emitEvent({
+        type: "MISS",
+        ts: Date.now(),
+        data: {
+          sessionId,
+          taskId,
+          color: color,
+          missedLeft: leftTarget,
+          missedRight: rightTarget,
+          durationMs: plannedDuration,
+        },
+      });
+
+      // Po MISS nepřizpůsobujeme rychlost (adaptace je jen po HIT).
+
+      // nový target
+      spawnNewTargets();
+    }, plannedDuration);
+  }, [
+    clearExpireTimeout,
+    emitEvent,
+    sessionId,
+    taskId,
+    color,
+    leftTarget,
+    rightTarget,
+    pushOutcome,
+  ]);
+
+  // nastaví nové targety, barvu, timestamp a spustí nový timeout okna
+  const spawnNewTargets = useCallback(() => {
+    if (!gameRunningRef.current) return;
+
+    const chosenColor = pickColor();
+    setColor(chosenColor);
+
+    const newLeft = pickRandomCell();
+    const newRight = pickRandomCell();
+
+    setLeftTarget(newLeft);
+    setRightTarget(newRight);
+
+    const now = Date.now();
+    lastTargetShownTsRef.current = now;
+
+    // nové časové okno pro tenhle target
+    scheduleExpire();
+  }, [pickColor, pickRandomCell, scheduleExpire]);
+
+  // klik hráče
+  const handleCellClick = useCallback(
+    ({ side, index }) => {
+      if (!gameRunningRef.current) return;
+      const now = Date.now();
+
+      const isHit =
+        (side === "left" && index === leftTarget) ||
+        (side === "right" && index === rightTarget);
+
+      if (isHit) {
+        hitsRef.current += 1;
+
+        // spočti reakční čas od posledního rozsvícení
+        if (lastTargetShownTsRef.current) {
+          const rt = now - lastTargetShownTsRef.current;
+          reactionTimesRef.current.push(rt);
+
+          // push pro adaptaci
+          pushLastHitRT(rt);
+        }
+
+        pushOutcome("HIT");
+
+        emitEvent({
+          type: "HIT",
+          ts: now,
+          data: {
+            sessionId,
+            taskId,
+            side,
+            cellIndex: index,
+            color: color,
+            hitsTotal: hitsRef.current,
+            durationMs: durationRef.current,
+          },
+        });
+
+        // po HIT adaptujeme rychlost podle pravidel
+        maybeAdaptSpeed();
+
+        // hráč trefil dřív než vypršel timeout -> stopni aktuální timeout
+        clearExpireTimeout();
+
+        // nový target + nový timeout
+        spawnNewTargets();
+      } else {
+        errorsRef.current += 1;
+
+        pushOutcome("ERROR");
+
+        emitEvent({
+          type: "ERROR",
+          ts: now,
+          data: {
+            sessionId,
+            taskId,
+            side,
+            cellIndex: index,
+            expectedLeft: leftTarget,
+            expectedRight: rightTarget,
+            color: color,
+            errorsTotal: errorsRef.current,
+            durationMs: durationRef.current,
+          },
+        });
+      }
+    },
+    [
+      emitEvent,
+      sessionId,
+      taskId,
+      color,
+      leftTarget,
+      rightTarget,
+      clearExpireTimeout,
+      spawnNewTargets,
+      maybeAdaptSpeed,
+      pushLastHitRT,
+      pushOutcome,
+    ]
+  );
+
+  // start hry při mountu, cleanup při unmountu
+  useEffect(() => {
+    const now = Date.now();
+    startTimeRef.current = now;
+    gameRunningRef.current = true;
+
+    emitEvent({
+      type: "START",
+      ts: now,
+      data: {
+        sessionId,
+        taskId,
+        note: "DualGrid50CatchGame START",
+        durationMs: durationRef.current,
+      },
+    });
+
+    // první target
+    spawnNewTargets();
+
+    return () => {
+      gameRunningRef.current = false;
+      clearExpireTimeout();
+
+      const endTs = Date.now();
+      const totalTimeMs =
+        startTimeRef.current != null ? endTs - startTimeRef.current : 0;
+
+      const rtList = reactionTimesRef.current;
+      const hits = hitsRef.current;
+      const errors = errorsRef.current;
+
+      let rtAvg = 0;
+      if (rtList.length > 0) {
+        const sum = rtList.reduce((acc, v) => acc + v, 0);
+        rtAvg = sum / rtList.length;
+      }
+
+      const metrics = {
+        Completion_Time: totalTimeMs,
+        Reaction_Time_Avg: rtAvg,
+        Reaction_Time_List: rtList,
+        Hits: hits,
+        Errors: errors,
+        Total_Lines: 0, // placeholder podle sjednoceného slovníku
+        Final_Speed: durationRef.current, // aktuální tempo jako výstup
+      };
+
+      emitEvent({
+        type: "END",
+        ts: endTs,
+        data: {
+          sessionId,
+          taskId,
+          totalTime: totalTimeMs,
+          hits,
+          errors,
+          finalDurationMs: durationRef.current,
+        },
+      });
+
+      emitScore({
+        taskId,
+        metrics,
+      });
+    };
+  }, [emitEvent, emitScore, sessionId, taskId, spawnNewTargets, clearExpireTimeout]);
+
+  // render jedné buňky
+  const renderCell = useCallback(
+    ({ side, index }) => {
+      const isActive =
+        (side === "left" && index === leftTarget) ||
+        (side === "right" && index === rightTarget);
+
+      // vizuální styl tečky
+      let dotBg = "rgba(255,255,255,0.08)"; // neaktivní
+      let dotShadow = "none";
+
+      if (isActive && color === "green") {
+        dotBg = "rgba(0,255,0,0.9)";
+        dotShadow = "0 0 8px rgba(0,255,0,0.9)";
+      } else if (isActive && color === "red") {
+        dotBg = "rgba(255,0,0,0.9)";
+        dotShadow = "0 0 8px rgba(255,0,0,0.9)";
+      }
+
+      const cellStyle = {
+        width: "100%",
+        height: "100%",
+        boxSizing: "border-box",
+        border: "1px solid rgba(255,255,255,0.06)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        backgroundColor: "rgba(0,0,0,0.6)",
+        cursor: "pointer",
+        userSelect: "none",
+      };
+
+      const dotStyle = {
+        width: "60%",
+        height: "60%",
+        borderRadius: "50%",
+        backgroundColor: dotBg,
+        boxShadow: dotShadow,
+      };
+
+      return (
+        <div
+          key={index}
+          style={cellStyle}
+          onClick={() => handleCellClick({ side, index })}
+        >
+          <div style={dotStyle} />
+        </div>
+      );
+    },
+    [handleCellClick, leftTarget, rightTarget, color]
+  );
+
+  // jeden grid panel
+  const GridPanel = ({ side, label }) => {
+    const columnWrapperStyle = {
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+    };
+
+    const titleStyle = {
+      fontSize: "1rem",
+      fontWeight: 500,
+      color: "rgba(255,255,255,0.6)",
+      letterSpacing: "0.05em",
+      marginBottom: "0.75rem",
+      textAlign: "center",
+    };
+
+    const gridWrapperStyle = {
+      width: "45vh", // čtverec podle výšky viewportu
+      height: "45vh",
+      display: "grid",
+      gridTemplateColumns: `repeat(${GRID_SIZE}, 1fr)`,
+      gridTemplateRows: `repeat(${GRID_SIZE}, 1fr)`,
+      backgroundColor: "rgba(0,0,0,0.6)",
+      border: "2px solid rgba(255,255,255,0.2)",
+      borderRadius: "8px",
+      boxShadow: "0 10px 30px rgba(0,0,0,0.8)",
+      overflow: "hidden",
+    };
+
+    const cells = [];
+    for (let i = 0; i < TOTAL_CELLS; i++) {
+      cells.push(renderCell({ side, index: i }));
+    }
+
+    return (
+      <div style={columnWrapperStyle}>
+        <div style={titleStyle}>{label}</div>
+        <div style={gridWrapperStyle}>{cells}</div>
+      </div>
+    );
+  };
+
+  // layout pro oba gridy
+  const outerStyle = {
+    width: "100vw",
+    height: "100vh",
+    backgroundColor: "black",
+    color: "white",
+    display: "flex",
+    flexDirection: "row",
+    justifyContent: "space-evenly",
+    alignItems: "center",
+    fontFamily:
+      'system-ui, -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif',
+  };
+
+  // UI + debug info o aktuálním tempu (durationMs)
+  const debugBoxStyle = {
+    position: "absolute",
+    top: "1rem",
+    left: "1rem",
+    backgroundColor: "rgba(0,0,0,0.6)",
+    color: "rgba(255,255,255,0.7)",
+    fontSize: "0.8rem",
+    lineHeight: 1.4,
+    padding: "0.5rem 0.75rem",
+    border: "1px solid rgba(255,255,255,0.2)",
+    borderRadius: "6px",
+    minWidth: "160px",
+    fontFamily:
+      'system-ui, -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif',
+  };
+
+  return (
+    <div style={outerStyle}>
+      <div style={debugBoxStyle}>
+        <div>DualGrid50CatchGame</div>
+        <div>durationMs: {durationMs} ms</div>
+        <div>hits: {hitsRef.current}</div>
+        <div>errors: {errorsRef.current}</div>
+      </div>
+
+      <GridPanel side="left" label="LEFT GRID 50×50" />
+      <GridPanel side="right" label="RIGHT GRID 50×50" />
+    </div>
+  );
+}
