@@ -1,0 +1,736 @@
+import React, { useEffect, useRef, useState, useCallback } from "react";
+
+/**
+ * MultiSaccadeWaitGame
+ *
+ * Typ: WAIT (synchronní takt)
+ *
+ * Mechanika:
+ * 1. Všechny body (3–6) se současně přesunou na další waitpoint (index 0..5).
+ * 2. Po doručení proběhne korekce vzdálenosti (SAFE_ZONE) a body se rozsvítí zeleně.
+ * 3. Hráč musí kliknout na každý bod (HIT) před timeoutem, jinak ERROR.
+ * 4. Jakmile jsou všechny body vyřešené, začíná další takt = další waitpoint.
+ * 5. Po waitpointu index 5 dostane bod novou trajektorii a jede dál od indexu 0.
+ *
+ * Adaptace obtížnosti:
+ * - po každých 20 vyhodnocených interakcích (HIT/ERROR) se spočítá výkon
+ * - pokud výkon vysoký → přidáme bod (max 6)
+ * - pokud výkon slabý → ubereme bod (min 3)
+ *
+ * iSenses standard:
+ * props { sessionId, taskId, emitEvent, emitScore }
+ * emitEvent({type,ts,data})
+ * emitScore({taskId,metrics})
+ */
+
+const GAME_DURATION_MS = 60_000;
+const CLICK_TIMEOUT_MS = 1500;
+
+const DOT_RADIUS_PX = 12;
+const SAFE_ZONE_PX = 36; // minimální odstup střed–střed mezi body v wait fázi
+const MOVE_SPEED_PX_PER_SEC = 400;
+
+const MIN_DOTS = 3;
+const MAX_DOTS = 6;
+
+const ADAPT_WINDOW = 20; // po kolika interakcích přepočítáváme level
+
+// Trajektorie: každá MUSÍ mít přesně 6 waitpointů v normalizovaných souřadnicích (0..1).
+// Můžeme ladit tvary, ale délka = 6 je fixní kvůli synchronizaci taktu.
+const TRAJECTORIES = [
+  // horizontální linie střed
+  [
+    { x: 0.15, y: 0.5 },
+    { x: 0.30, y: 0.5 },
+    { x: 0.45, y: 0.5 },
+    { x: 0.60, y: 0.5 },
+    { x: 0.75, y: 0.5 },
+    { x: 0.90, y: 0.5 },
+  ],
+  // vertikální linie vlevo
+  [
+    { x: 0.20, y: 0.15 },
+    { x: 0.20, y: 0.30 },
+    { x: 0.20, y: 0.45 },
+    { x: 0.20, y: 0.60 },
+    { x: 0.20, y: 0.75 },
+    { x: 0.20, y: 0.90 },
+  ],
+  // diagonála ↘
+  [
+    { x: 0.10, y: 0.10 },
+    { x: 0.25, y: 0.25 },
+    { x: 0.40, y: 0.40 },
+    { x: 0.55, y: 0.55 },
+    { x: 0.70, y: 0.70 },
+    { x: 0.85, y: 0.85 },
+  ],
+  // kruh / ovál
+  [
+    { x: 0.50, y: 0.20 },
+    { x: 0.65, y: 0.35 },
+    { x: 0.65, y: 0.65 },
+    { x: 0.50, y: 0.80 },
+    { x: 0.35, y: 0.65 },
+    { x: 0.35, y: 0.35 },
+  ],
+  // zig-zag vodorovný
+  [
+    { x: 0.15, y: 0.70 },
+    { x: 0.30, y: 0.50 },
+    { x: 0.45, y: 0.70 },
+    { x: 0.60, y: 0.50 },
+    { x: 0.75, y: 0.70 },
+    { x: 0.90, y: 0.50 },
+  ],
+];
+
+// Pick random trajectory index different from last to reduce habituation
+function pickNewTrajectoryIdx(excludeIdx) {
+  let idx = Math.floor(Math.random() * TRAJECTORIES.length);
+  if (excludeIdx !== undefined && TRAJECTORIES.length > 1) {
+    while (idx === excludeIdx) {
+      idx = Math.floor(Math.random() * TRAJECTORIES.length);
+    }
+  }
+  return idx;
+}
+
+// distance helper
+function dist(a, b) {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+// vrátí kolmici na vektor (ax, ay) normalizovanou
+function perpendicularUnit(ax, ay) {
+  const len = Math.sqrt(ax * ax + ay * ay) || 1;
+  // kolmé směry jsou ( -ay, ax ) nebo ( ay, -ax )
+  return { ux: -ay / len, uy: ax / len, vx: ay / len, vy: -ax / len };
+}
+
+export default function MultiSaccadeWaitGame({
+  sessionId,
+  taskId,
+  emitEvent,
+  emitScore,
+}) {
+  const containerRef = useRef(null);
+  const animRef = useRef(null);
+
+  const [dots, setDots] = useState([]); // [{trajIdx, wpIndex, x, y, targetX, targetY, state:"moving"|"waiting"|"doneThisWait", waitStartTs}]
+  const [dotCount, setDotCount] = useState(MIN_DOTS);
+
+  const [taktPhase, setTaktPhase] = useState("move"); // "move" | "wait"
+  // "move": body letí na další waitpoint
+  // "wait": body stojí zeleně, hráč kliká
+
+  const [started, setStarted] = useState(false);
+  const [ended, setEnded] = useState(false);
+
+  // metriky
+  const startTsRef = useRef(null);
+  const hitsRef = useRef(0);
+  const errorsRef = useRef(0);
+  const reactionTimesRef = useRef([]);
+
+  // adapt buffer (posledních 20 interakcí)
+  const adaptBufferRef = useRef([]); // [{hit:bool, rtMs:number|null}]
+
+  // časování
+  const timeoutHandlesRef = useRef([]);
+
+  // init
+  useEffect(() => {
+    const area = containerRef.current;
+    if (!area) return;
+    const rect = area.getBoundingClientRect();
+
+    // vytvoření výchozích bodů
+    const initDots = [];
+    for (let i = 0; i < MIN_DOTS; i++) {
+      const trajIdx = pickNewTrajectoryIdx(undefined);
+      const wpIndex = 0; // začínáme na prvním waitpointu trajektorie
+      const wp = TRAJECTORIES[trajIdx][wpIndex];
+      initDots.push({
+        trajIdx,
+        wpIndex,
+        x: wp.x * rect.width,
+        y: wp.y * rect.height,
+        targetX: wp.x * rect.width,
+        targetY: wp.y * rect.height,
+        state: "waiting", // první stav = už stojíme v prvním waitpointu
+        waitStartTs: Date.now(),
+        lastTrajIdx: trajIdx,
+      });
+    }
+
+    setDots(initDots);
+    setTaktPhase("wait");
+    setStarted(true);
+    startTsRef.current = Date.now();
+
+    if (emitEvent) {
+      emitEvent({
+        type: "START",
+        ts: Date.now(),
+        data: { sessionId, taskId, dotCount: MIN_DOTS, mode: "WAIT" },
+      });
+    }
+
+    // konec hry po GAME_DURATION_MS
+    const endTimer = setTimeout(() => {
+      endGame();
+    }, GAME_DURATION_MS);
+
+    return () => {
+      clearTimeout(endTimer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // hlavní loop animace pohybu v "move" fázi
+  useEffect(() => {
+    if (!started || ended) return;
+    if (taktPhase !== "move") return;
+
+    const area = containerRef.current;
+    if (!area) return;
+    const rect = area.getBoundingClientRect();
+
+    let lastTs = performance.now();
+
+    function step(now) {
+      const dtMs = now - lastTs;
+      lastTs = now;
+      const dtSec = dtMs / 1000;
+
+      setDots((prev) => {
+        const newDots = prev.map((d) => {
+          if (d.state !== "moving") return d;
+
+          const dx = d.targetX - d.x;
+          const dy = d.targetY - d.y;
+          const distance = Math.sqrt(dx * dx + dy * dy);
+
+          const stepPx = MOVE_SPEED_PX_PER_SEC * dtSec;
+          if (distance <= stepPx) {
+            // doletěl do cíle waitpointu -> přepneme do "waiting"
+            return {
+              ...d,
+              x: d.targetX,
+              y: d.targetY,
+              state: "waiting",
+              waitStartTs: Date.now(),
+            };
+          } else {
+            const ratio = stepPx / distance;
+            return {
+              ...d,
+              x: d.x + dx * ratio,
+              y: d.y + dy * ratio,
+            };
+          }
+        });
+
+        // pokud VŠECHNY body jsou waiting -> přejdeme do WAIT fáze
+        const allWaiting = newDots.every((b) => b.state === "waiting");
+        if (allWaiting) {
+          // oprav pozice kvůli SAFE_ZONE_PX
+          const correctedDots = applySafeZoneCorrection(newDots);
+
+          // nastav timeouty pro každý bod
+          scheduleTimeoutsForWait(correctedDots);
+
+          setTaktPhase("wait");
+          return correctedDots;
+        }
+
+        return newDots;
+      });
+
+      animRef.current = requestAnimationFrame(step);
+    }
+
+    animRef.current = requestAnimationFrame(step);
+    return () => {
+      if (animRef.current) cancelAnimationFrame(animRef.current);
+    };
+  }, [started, ended, taktPhase]);
+
+  // klik hráče
+  const handleClick = useCallback(
+    (e) => {
+      if (ended) return;
+      if (taktPhase !== "wait") return;
+
+      const area = containerRef.current;
+      if (!area) return;
+      const rect = area.getBoundingClientRect();
+
+      const clickX = e.clientX - rect.left;
+      const clickY = e.clientY - rect.top;
+
+      setDots((prev) => {
+        const updated = prev.map((d) => {
+          if (d.state !== "waiting") return d; // už vyřešený nebo mimo wait
+          const dx = clickX - d.x;
+          const dy = clickY - d.y;
+          const distance = Math.sqrt(dx * dx + dy * dy);
+
+          if (distance <= DOT_RADIUS_PX * 1.5) {
+            // HIT
+            const rt = Date.now() - d.waitStartTs;
+            hitsRef.current += 1;
+            reactionTimesRef.current.push(rt);
+
+            adaptBufferRef.current.push({ hit: true, rtMs: rt });
+            checkAdaptationMaybe();
+
+            if (emitEvent) {
+              emitEvent({
+                type: "HIT",
+                ts: Date.now(),
+                data: {
+                  x: d.x,
+                  y: d.y,
+                  reactionTimeMs: rt,
+                },
+              });
+            }
+
+            return {
+              ...d,
+              state: "doneThisWait",
+            };
+          }
+          return d;
+        });
+
+        // po kliknutí zkontroluj, jestli jsou všechny body vyřešené
+        if (allDotsResolved(updated)) {
+          startNextTakt(updated);
+        }
+
+        return updated;
+      });
+    },
+    [ended, taktPhase, emitEvent]
+  );
+
+  // timeout pro body, které hráč nestihne
+  function scheduleTimeoutsForWait(dotsNow) {
+    // zruš staré timeouty
+    timeoutHandlesRef.current.forEach((h) => clearTimeout(h));
+    timeoutHandlesRef.current = [];
+
+    dotsNow.forEach((d, idx) => {
+      if (d.state === "waiting") {
+        const h = setTimeout(() => {
+          // timeout -> ERROR pokud to ještě není vyřešeno klikem
+          setDots((curr) => {
+            const after = curr.map((x, j) => {
+              if (j !== idx) return x;
+              if (x.state !== "waiting") return x; // už to někdo trefil mezitím
+              errorsRef.current += 1;
+
+              adaptBufferRef.current.push({ hit: false, rtMs: null });
+              checkAdaptationMaybe();
+
+              if (emitEvent) {
+                emitEvent({
+                  type: "ERROR",
+                  ts: Date.now(),
+                  data: {
+                    reason: "timeout",
+                    x: x.x,
+                    y: x.y,
+                  },
+                });
+              }
+
+              return {
+                ...x,
+                state: "doneThisWait",
+              };
+            });
+
+            if (allDotsResolved(after)) {
+              startNextTakt(after);
+            }
+            return after;
+          });
+        }, CLICK_TIMEOUT_MS);
+        timeoutHandlesRef.current.push(h);
+      }
+    });
+  }
+
+  // ověření jestli všechno v aktuálním taktu je vyřešené
+  function allDotsResolved(dotsArr) {
+    return dotsArr.every(
+      (d) => d.state === "doneThisWait" || d.state === "moving"
+    );
+  }
+
+  // vyvolá další takt: posun na další waitpoint index+1 nebo nová trajektorie
+  function startNextTakt(prevDots) {
+    // rušíme timeouty, protože WAIT končí
+    timeoutHandlesRef.current.forEach((h) => clearTimeout(h));
+    timeoutHandlesRef.current = [];
+
+    // pro každý bod spočítáme další target waitpoint
+    const area = containerRef.current;
+    if (!area) return;
+    const rect = area.getBoundingClientRect();
+
+    const movedDots = prevDots.map((d) => {
+      // urči další wpIndex
+      let nextWpIndex = d.wpIndex + 1;
+      let nextTrajIdx = d.trajIdx;
+      let lastTrajIdx = d.lastTrajIdx;
+
+      // pokud jsme dokončili index 5 → přepni na novou trajektorii a začni z indexu 0
+      if (nextWpIndex > 5) {
+        nextTrajIdx = pickNewTrajectoryIdx(d.trajIdx);
+        lastTrajIdx = nextTrajIdx;
+        nextWpIndex = 0;
+      }
+
+      const targetNorm = TRAJECTORIES[nextTrajIdx][nextWpIndex];
+      const targetPx = {
+        x: targetNorm.x * rect.width,
+        y: targetNorm.y * rect.height,
+      };
+
+      return {
+        ...d,
+        trajIdx: nextTrajIdx,
+        lastTrajIdx,
+        wpIndex: nextWpIndex,
+        targetX: targetPx.x,
+        targetY: targetPx.y,
+        state: "moving",
+        waitStartTs: null,
+      };
+    });
+
+    setDots(movedDots);
+    setTaktPhase("move");
+  }
+
+  // korekce SAFE_ZONE_PX (rozestoupit body bočně podle kolmice na směr letu)
+  function applySafeZoneCorrection(dotsArr) {
+    // pracujeme na kopii
+    const out = dotsArr.map((d) => ({ ...d }));
+
+    for (let i = 0; i < out.length; i++) {
+      for (let j = i + 1; j < out.length; j++) {
+        const da = out[i];
+        const db = out[j];
+        const distanceNow = dist(da, db);
+
+        if (distanceNow < SAFE_ZONE_PX) {
+          // spočítej směr pohybu da jako vektor od předchozího bodu trajektorie
+          // NOTE: nemáme uloženou předchozí pozici explicitly, takže pro teď
+          // použijeme vektor (targetX - x, targetY - y) z fáze move
+          // Pokud jsme už ve wait fázi, x,y == targetX,targetY, vektor bude nulový.
+          // fallback: použijeme náhodnou kolmici.
+          let ax = da.targetX - da.x;
+          let ay = da.targetY - da.y;
+          if (ax === 0 && ay === 0) {
+            // fallback random dir
+            ax = 1;
+            ay = 0;
+          }
+          const { ux, uy, vx, vy } = perpendicularUnit(ax, ay);
+
+          // zkus odsazení jedním směrem
+          const cand1 = {
+            x: da.x + ux * 20,
+            y: da.y + uy * 20,
+          };
+          const cand2 = {
+            x: da.x + vx * 20,
+            y: da.y + vy * 20,
+          };
+
+          // vyber lepší kandidát = který je dál od db
+          const d1 = dist(cand1, db);
+          const d2 = dist(cand2, db);
+
+          if (d1 >= d2 && d1 > distanceNow) {
+            da.x = cand1.x;
+            da.y = cand1.y;
+          } else if (d2 > distanceNow) {
+            da.x = cand2.x;
+            da.y = cand2.y;
+          }
+          // v případě že pořád kolidují, bychom mohli přidat větší offset (40px),
+          // ale držíme to teď jednoduché.
+        }
+      }
+    }
+    return out;
+  }
+
+  // adaptace obtížnosti po každých ADAPT_WINDOW interakcích
+  function checkAdaptationMaybe() {
+    const buf = adaptBufferRef.current;
+    if (buf.length < ADAPT_WINDOW) return;
+
+    const total = buf.length;
+    let hitCount = 0;
+    let rtSum = 0;
+    let rtN = 0;
+
+    buf.forEach((ev) => {
+      if (ev.hit) {
+        hitCount += 1;
+        if (typeof ev.rtMs === "number") {
+          rtSum += ev.rtMs;
+          rtN += 1;
+        }
+      }
+    });
+
+    const hitRate = hitCount / total; // HIT / (HIT+ERROR)
+    const rtAvg = rtN > 0 ? rtSum / rtN : Infinity;
+
+    // rozhodnutí
+    if (
+      hitRate >= 0.8 &&
+      rtAvg <= 500 &&
+      dotCount < MAX_DOTS
+    ) {
+      // LEVEL UP
+      const newCount = dotCount + 1;
+      setDotCount(newCount);
+
+      if (emitEvent) {
+        emitEvent({
+          type: "LEVEL_UP",
+          ts: Date.now(),
+          data: { newDotCount: newCount, hitRate, rtAvg },
+        });
+      }
+
+      // přidáme nový bod
+      addNewDot();
+    } else if (
+      (hitRate <= 0.5 || rtAvg > 1000) &&
+      dotCount > MIN_DOTS
+    ) {
+      // LEVEL DOWN
+      const newCount = dotCount - 1;
+      setDotCount(newCount);
+
+      if (emitEvent) {
+        emitEvent({
+          type: "LEVEL_DOWN",
+          ts: Date.now(),
+          data: { newDotCount: newCount, hitRate, rtAvg },
+        });
+      }
+
+      removeOneDot();
+    }
+
+    // reset bufferu
+    adaptBufferRef.current = [];
+  }
+
+  // přidání nového bodu při LEVEL_UP
+  function addNewDot() {
+    setDots((curr) => {
+      const area = containerRef.current;
+      if (!area) return curr;
+      const rect = area.getBoundingClientRect();
+
+      const trajIdx = pickNewTrajectoryIdx(undefined);
+      const wpIndex = 0;
+      const wpNorm = TRAJECTORIES[trajIdx][wpIndex];
+      const pxX = wpNorm.x * rect.width;
+      const pxY = wpNorm.y * rect.height;
+
+      const newDot = {
+        trajIdx,
+        lastTrajIdx: trajIdx,
+        wpIndex,
+        x: pxX,
+        y: pxY,
+        targetX: pxX,
+        targetY: pxY,
+        state: taktPhase === "wait" ? "waiting" : "moving",
+        waitStartTs: taktPhase === "wait" ? Date.now() : null,
+      };
+
+      return [...curr, newDot];
+    });
+  }
+
+  // odebrání bodu při LEVEL_DOWN
+  function removeOneDot() {
+    setDots((curr) => {
+      if (curr.length <= MIN_DOTS) return curr;
+      // jednoduchá strategie: odeber poslední přidaný bod (poslední v poli)
+      const reduced = curr.slice(0, curr.length - 1);
+      return reduced;
+    });
+  }
+
+  // ukončení hry
+  const endGame = useCallback(() => {
+    if (ended) return;
+    setEnded(true);
+
+    // zruš timeouty
+    timeoutHandlesRef.current.forEach((h) => clearTimeout(h));
+    timeoutHandlesRef.current = [];
+
+    if (animRef.current) cancelAnimationFrame(animRef.current);
+
+    const endTs = Date.now();
+    const completionTimeMs = endTs - startTsRef.current;
+
+    const rtList = reactionTimesRef.current.slice();
+    const reactionTimeAvgMs =
+      rtList.length > 0
+        ? Math.round(
+            rtList.reduce((sum, v) => sum + v, 0) / rtList.length
+          )
+        : 0;
+
+    // Total_Lines = kolik "trajektorií" (šestipointových cyklů) dokončily body.
+    // Zatím nemáme counter na dokončené cykly => TODO. Teď 0.
+    const totalLines = 0;
+
+    const metrics = {
+      Completion_Time: completionTimeMs,
+      Reaction_Time_Avg: reactionTimeAvgMs,
+      Reaction_Time_List: rtList,
+      Hits: hitsRef.current,
+      Errors: errorsRef.current,
+      Total_Lines: totalLines,
+      Final_Speed: MOVE_SPEED_PX_PER_SEC,
+    };
+
+    if (emitEvent) {
+      emitEvent({
+        type: "END",
+        ts: Date.now(),
+        data: { sessionId, taskId, metrics },
+      });
+    }
+
+    if (emitScore) {
+      emitScore({
+        taskId,
+        metrics,
+      });
+    }
+  }, [ended, emitEvent, emitScore, taskId]);
+
+  // cleanup při unmountu
+  useEffect(() => {
+    return () => {
+      timeoutHandlesRef.current.forEach((h) => clearTimeout(h));
+      timeoutHandlesRef.current = [];
+      if (animRef.current) cancelAnimationFrame(animRef.current);
+
+      if (!ended && startTsRef.current) {
+        const endTs = Date.now();
+        const completionTimeMs = endTs - startTsRef.current;
+        const rtList = reactionTimesRef.current.slice();
+        const reactionTimeAvgMs =
+          rtList.length > 0
+            ? Math.round(
+                rtList.reduce((sum, v) => sum + v, 0) / rtList.length
+              )
+            : 0;
+
+        const metrics = {
+          Completion_Time: completionTimeMs,
+          Reaction_Time_Avg: reactionTimeAvgMs,
+          Reaction_Time_List: rtList,
+          Hits: hitsRef.current,
+          Errors: errorsRef.current,
+          Total_Lines: 0,
+          Final_Speed: MOVE_SPEED_PX_PER_SEC,
+        };
+
+        if (emitEvent) {
+          emitEvent({
+            type: "END",
+            ts: Date.now(),
+            data: { sessionId, taskId, metrics, forced: true },
+          });
+        }
+        if (emitScore) {
+          emitScore({
+            taskId,
+            metrics,
+          });
+        }
+      }
+    };
+  }, [ended, emitEvent, emitScore, taskId]);
+
+  // render
+  return (
+    <div
+      ref={containerRef}
+      onClick={handleClick}
+      style={{
+        position: "relative",
+        width: "100%",
+        height: "100%",
+        backgroundColor: "#000",
+        overflow: "hidden",
+        touchAction: "none",
+        userSelect: "none",
+        cursor: "crosshair",
+      }}
+    >
+      {dots.map((d, idx) => {
+        const waiting = d.state === "waiting";
+        return (
+          <div
+            key={idx}
+            style={{
+              position: "absolute",
+              left: d.x - DOT_RADIUS_PX,
+              top: d.y - DOT_RADIUS_PX,
+              width: DOT_RADIUS_PX * 2,
+              height: DOT_RADIUS_PX * 2,
+              borderRadius: "50%",
+              backgroundColor: waiting ? "#00ff00" : "#ffffff",
+              pointerEvents: "none",
+            }}
+          />
+        );
+      })}
+
+      {ended && (
+        <div
+          style={{
+            position: "absolute",
+            left: 0,
+            top: 0,
+            width: "100%",
+            height: "100%",
+            backgroundColor: "rgba(0,0,0,0.6)",
+            color: "#fff",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            fontSize: "1.2rem",
+          }}
+        >
+          Session finished
+        </div>
+      )}
+    </div>
+  );
+}
