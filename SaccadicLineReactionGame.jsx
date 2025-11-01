@@ -27,11 +27,11 @@ export default function SaccadicLineReactionGame({ sessionId, taskId, emitEvent,
   const hitsRef = useRef(0);
   const errorsRef = useRef(0);
   const speedRef = useRef(400); // px/s
-  const SPEED_MIN = 250;
-  const SPEED_MAX = 900;
+  const SPEED_MIN = 800;
+  const SPEED_MAX = 2000;
   const GRID_GAP = 100;
-  const TOTAL_LINES = 6;
-  const HIGHLIGHT_COUNT = 3;
+  const TOTAL_LINES = 21;
+ const HIGHLIGHT_COUNT = Math.floor(4 + Math.random() * 3); // náhodně 4–6 záblesků
 
   const screenW = typeof window !== "undefined" ? window.innerWidth : 1200;
 
@@ -58,15 +58,20 @@ export default function SaccadicLineReactionGame({ sessionId, taskId, emitEvent,
           triggerNextLine();
         }
 
-        // aktivuj zelené momenty v přesných 3 pozicích
-        const thresholds = [0.33, 0.66, 0.95].map((f) => f * (screenW - 40));
-        const idx = thresholds.findIndex((t, i) => {
-          const prevT = i === 0 ? 0 : thresholds[i - 1];
-          return direction === 1
-            ? prev.x < t && newX >= t
-            : prev.x > screenW - t && newX <= screenW - t;
-        });
-        if (idx !== -1 && !colorOnRef.current) triggerHighlight();
+        // aktivuj zelené momenty v náhodném počtu (4–6) rovnoměrně rozložené po řádku
+const thresholds = Array.from({ length: HIGHLIGHT_COUNT }, (_, i) =>
+  ((i + 1) / (HIGHLIGHT_COUNT + 1)) * (screenW - 40)
+);
+
+const idx = thresholds.findIndex((t, i) => {
+  const prevT = i === 0 ? 0 : thresholds[i - 1];
+  return direction === 1
+    ? prev.x < t && newX >= t
+    : prev.x > screenW - t && newX <= screenW - t;
+});
+
+if (idx !== -1 && !colorOnRef.current) triggerHighlight();
+
 
         return { x: newX, y: newY };
       });
